@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from groq import Groq
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv() 
 
 app = FastAPI()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -23,7 +23,7 @@ def chat(chat_message: ChatMessage):
     conversation_history.append({"role": "user", "content": chat_message.message})
 
     response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",  # fast + generous free-tier limits, good for prototyping
+        model="openai/gpt-oss-20b",
         messages=conversation_history,
     )
 
