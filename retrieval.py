@@ -1,15 +1,12 @@
 """
-retrieval.py - RAG retrieval layer for the health chatbot.
+retrieval.py - Two-Stage RAG retrieval layer for the health chatbot.
 
-Flow: query -> BGE-M3 embedding -> Supabase RPC (match_document_chunks)
-    -> hydrate raw text from local Markdown -> list of RetrievedChunk
-
-Env vars:
-    SUPABASE_URL, SUPABASE_SERVICE_KEY
-    KNOWLEDGE_BASE_DIR  (default: ./knowledge_base)
-    MATCH_THRESHOLD     (default: 0.25)
-    MATCH_COUNT         (default: 3)
+Pipeline:
+  1. Candidate Fetch (Vector Search): Query -> BGE-M3 embedding -> Supabase RPC (Top 10)
+  2. Cross-Encoder Re-Ranking: BAAI/bge-reranker-v2-m3 scores (Query, Candidate) pairs -> Top 3
+  3. Context Hydration: Top 3 IDs -> Sub-millisecond Redis key lookup -> RetrievedChunk list
 """
+
 import hashlib
 import json
 import logging
@@ -17,25 +14,22 @@ import os
 import re
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
-from dotenv import load_dotenv
 
-import yaml
-from sentence_transformers import SentenceTransformer
+import redis
+from dotenv import load_dotenv
+from sentence_transformers import CrossEncoder, SentenceTransformer
 from supabase import create_client
 
 load_dotenv()
 
-KB_DIR = Path(os.getenv("KNOWLEDGE_BASE_DIR", "knowledge_base"))
-THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.25"))
-TOP_K = int(os.getenv("MATCH_COUNT", "3"))
-
+# Search defaults
+CANDIDATE_FETCH_COUNT = int(os.getenv("CANDIDATE_FETCH_COUNT", "10"))  # Vector candidates
+FINAL_TOP_K = int(os.getenv("MATCH_COUNT", "3"))                      # Re-ranked output
+THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.20"))
 MAX_PROMPT_CHARS = 2000
-# Health queries are sensitive: by default only a hash + vector are stored.
 STORE_QUERY_TEXT = os.getenv("STORE_QUERY_TEXT", "false").lower() == "true"
-log = logging.getLogger(__name__)
 
-METADATA_RE = re.compile(r"<!--\s*DOCUMENT_METADATA(.*?)-->", re.DOTALL)
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -44,72 +38,45 @@ class RetrievedChunk:
     document_id: str
     section_title: str | None
     subsection_title: str | None
-    similarity: float
+    similarity: float  # Re-ranker cross-encoder score
     text: str
 
 
-# ---------- Singletons ----------
+# ---------- Singletons & Connection Pooling ----------
+
 @lru_cache(maxsize=1)
-def _model() -> SentenceTransformer:
+def _embedding_model() -> SentenceTransformer:
+    log.info("Loading BAAI/bge-m3 embedding model...")
     return SentenceTransformer("BAAI/bge-m3")
 
 
 @lru_cache(maxsize=1)
-def _supabase():
-    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
-
-
-# ---------- Local knowledge base ----------
-def _parse_doc(path: Path) -> tuple[dict, dict]:
-    """Return (metadata, sections) where sections maps (h2, h3|None) -> text."""
-    raw = path.read_text(encoding="utf-8")
-    m = METADATA_RE.search(raw)
-    meta = yaml.safe_load(m.group(1)) if m else {}
-    body = METADATA_RE.sub("", raw, count=1)
-
-    sections: dict[tuple, list[str]] = {}
-    h2 = h3 = None
-    for line in body.splitlines():
-        if line.startswith("### "):
-            h3 = line[4:].strip()
-        elif line.startswith("## "):
-            h2, h3 = line[3:].strip(), None
-        elif line.startswith("# "):
-            continue
-        else:
-            sections.setdefault((h2, h3), []).append(line)
-    return meta or {}, {k: "\n".join(v).strip() for k, v in sections.items()}
+def _reranker_model() -> CrossEncoder:
+    log.info("Loading BAAI/bge-reranker-v2-m3 cross-encoder...")
+    return CrossEncoder("BAAI/bge-reranker-v2-m3")
 
 
 @lru_cache(maxsize=1)
-def _kb_index() -> dict[str, dict]:
-    """document_id -> {meta, sections}. Built once from knowledge_base/*.md."""
-    index = {}
-    for path in KB_DIR.glob("*.md"):
-        meta, sections = _parse_doc(path)
-        doc_id = meta.get("document_id") or path.stem
-        index[str(doc_id)] = {"meta": meta, "sections": sections}
-    return index
+def _supabase():
+    url = os.environ["SUPABASE_URL"]
+    key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+    return create_client(url, key)
 
 
-def _hydrate(document_id: str, section: str | None, subsection: str | None) -> str:
-    doc = _kb_index().get(document_id)
-    if not doc:
-        return ""
-    secs = doc["sections"]
-    if (section, subsection) in secs:
-        text = secs[(section, subsection)]
-    else:
-        # Fallback: everything under the H2 section
-        text = "\n\n".join(t for (h2, _), t in secs.items() if h2 == section)
-    disease = doc["meta"].get("disease_name", document_id)
-    crumb = " > ".join(p for p in (section, subsection) if p)
-    return f"[Disease: {disease} | Section: {crumb}]\n{text}".strip()
+@lru_cache(maxsize=1)
+def _redis():
+    host = os.getenv("REDIS_HOST", "localhost")
+    port = int(os.getenv("REDIS_PORT", "6379"))
+    password = os.getenv("REDIS_PASSWORD", None)
+    return redis.Redis(
+        host=host, port=port, password=password, decode_responses=True
+    )
 
 
-# ---------- Public API ----------
+# ---------- Query & Embedding Caching ----------
+
 def read_prompt(raw: str) -> str:
-    """Step 1: read and clean the user's input prompt."""
+    """Sanitizes user input string."""
     if not raw or not raw.strip():
         raise ValueError("Empty prompt")
     prompt = re.sub(r"\s+", " ", raw).strip()
@@ -122,67 +89,154 @@ def _query_hash(prompt: str) -> str:
 
 def _load_cached_embedding(qhash: str) -> list[float] | None:
     try:
-        res = (_supabase().table("query_embeddings").select("embedding")
-                .eq("query_hash", qhash).limit(1).execute())
+        res = (
+            _supabase()
+            .table("query_embeddings")
+            .select("embedding")
+            .eq("query_hash", qhash)
+            .limit(1)
+            .execute()
+        )
         if res.data:
             emb = res.data[0]["embedding"]
             return json.loads(emb) if isinstance(emb, str) else emb
-    except Exception as e:  # cache failure must never break retrieval
+    except Exception as e:
         log.warning("Query embedding cache read failed: %s", e)
     return None
 
 
 def _store_embedding(qhash: str, prompt: str, vec: list[float]) -> None:
     try:
-        _supabase().table("query_embeddings").upsert({
-            "query_hash": qhash,
-            "query_text": prompt if STORE_QUERY_TEXT else None,
-            "embedding": vec,
-        }, on_conflict="query_hash").execute()
+        _supabase().table("query_embeddings").upsert(
+            {
+                "query_hash": qhash,
+                "query_text": prompt if STORE_QUERY_TEXT else None,
+                "embedding": vec,
+            },
+            on_conflict="query_hash",
+        ).execute()
     except Exception as e:
         log.warning("Query embedding store failed: %s", e)
 
 
 def embed_query(raw_prompt: str) -> list[float]:
-    """Step 2: prompt -> normalized 1024-dim BGE-M3 vector.
-    Embeddings are stored in the separate `query_embeddings` table and reused
-    on repeat questions."""
+    """Generate 1024-dim BGE-M3 query vector with Supabase embedding cache."""
     prompt = read_prompt(raw_prompt)
     qhash = _query_hash(prompt)
     cached = _load_cached_embedding(qhash)
     if cached:
         return cached
-    vec = _model().encode(prompt, normalize_embeddings=True).tolist()
+
+    vec = _embedding_model().encode(prompt, normalize_embeddings=True).tolist()
     _store_embedding(qhash, prompt, vec)
     return vec
 
 
-def retrieve(query: str, top_k: int = TOP_K, threshold: float = THRESHOLD) -> list[RetrievedChunk]:
-    """Step 3: cosine-similarity search (HNSW) in Supabase, then hydrate text."""
+# ---------- Hydration & Re-ranking ----------
+
+def hydrate_from_redis(chunk_ids: list[str]) -> list[str | None]:
+    """Sub-millisecond batch text hydration via Redis MGET."""
+    if not chunk_ids:
+        return []
+    try:
+        return _redis().mget(chunk_ids)
+    except Exception as e:
+        log.error("Redis hydration failed: %s", e)
+        return [None] * len(chunk_ids)
+
+
+def rerank_candidates(query: str, candidates: list[dict], top_k: int = FINAL_TOP_K) -> list[dict]:
+    """Re-scores candidate chunks using BAAI/bge-reranker-v2-m3."""
+    if not candidates:
+        return []
+
+    reranker = _reranker_model()
+    chunk_ids = [c["id"] for c in candidates]
+    
+    # Batch hydrate candidate raw texts for cross-encoder evaluation
+    raw_texts = hydrate_from_redis(chunk_ids)
+
+    valid_pairs = []
+    valid_candidates = []
+    
+    for candidate, text in zip(candidates, raw_texts):
+        if text:
+            candidate["text"] = text
+            valid_pairs.append([query, text])
+            valid_candidates.append(candidate)
+
+    if not valid_pairs:
+        return []
+
+    # Calculate cross-encoder cross-attention scores
+    scores = reranker.predict(valid_pairs)
+
+    # Attach re-ranker scores back to candidates
+    for candidate, score in zip(valid_candidates, scores):
+        candidate["rerank_score"] = float(score)
+
+    # Sort candidates descending by Cross-Encoder score
+    reranked = sorted(valid_candidates, key=lambda x: x["rerank_score"], reverse=True)
+    return reranked[:top_k]
+
+
+# ---------- Core Public API ----------
+
+def retrieve(
+    query: str, 
+    fetch_k: int = CANDIDATE_FETCH_COUNT, 
+    final_k: int = FINAL_TOP_K, 
+    threshold: float = THRESHOLD
+) -> list[RetrievedChunk]:
+    """
+    Executes a 2-Stage Retrieval:
+    1. Vector similarity search in Supabase (HNSW Index) -> Fetch top candidate set.
+    2. Cross-Encoder Re-Ranking (BGE-Reranker-v2-m3) -> Return final Top K chunks.
+    """
+    query_vector = embed_query(query)
+
+    # Stage 1: Vector Search candidate recall (Top 10)
     resp = _supabase().rpc(
         "match_document_chunks",
-        {"query_embedding": embed_query(query), "match_threshold": threshold, "match_count": top_k},
+        {
+            "query_embedding": query_vector,
+            "match_threshold": threshold,
+            "match_count": fetch_k,
+        },
     ).execute()
 
-    chunks, seen = [], set()
-    for row in resp.data or []:
-        key = (row["document_id"], row["section_title"], row["subsection_title"])
-        if key in seen:  # chunks from the same subsection hydrate to identical text
-            continue
-        seen.add(key)
-        text = _hydrate(*key)
-        if text:
-            chunks.append(RetrievedChunk(
-                id=row["id"], document_id=row["document_id"],
-                section_title=row["section_title"], subsection_title=row["subsection_title"],
-                similarity=row["similarity"], text=text,
-            ))
-    return chunks
+    matched_candidates = resp.data or []
+    if not matched_candidates:
+        return []
+
+    # Stage 2: Cross-Encoder re-ranking & Redis text hydration
+    top_ranked = rerank_candidates(query, matched_candidates, top_k=final_k)
+
+    # Build final response objects
+    results = []
+    for item in top_ranked:
+        results.append(
+            RetrievedChunk(
+                id=item["id"],
+                document_id=item["document_id"],
+                section_title=item.get("section_title"),
+                subsection_title=item.get("subsection_title"),
+                similarity=item.get("rerank_score", 0.0),
+                text=item["text"],
+            )
+        )
+
+    return results
 
 
 if __name__ == "__main__":
     import sys
+
     q = " ".join(sys.argv[1:]) or "What is the treatment for chloroquine-resistant malaria?"
-    for c in retrieve(q):
-        print(f"\n--- {c.similarity:.3f} | {c.section_title} > {c.subsection_title} ---")
-        print(c.text[:400])
+    print(f"Executing 2-stage retrieval for query: '{q}'\n")
+
+    results = retrieve(q)
+    for c in results:
+        print(f"--- [Re-rank Score: {c.similarity:.4f}] | {c.id} | {c.section_title} > {c.subsection_title} ---")
+        print(c.text)
+        print("\n" + "=" * 60 + "\n")

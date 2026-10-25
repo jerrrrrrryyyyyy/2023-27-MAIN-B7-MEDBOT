@@ -3,14 +3,9 @@
 ingest_knowledge_base.py
 
 Reads every disease markdown file in a folder, chunks each one on its
-markdown headers (H2 primary, H3 fallback, with near-empty "Not specified
-in the provided source" subsections merged into a neighbor rather than
-becoming their own vector), embeds the chunks with BGE-M3 (1024 dims), and inserts
-them into the document_chunks table in Supabase via the Supabase Python SDK.
-
-It also writes a sidecar file per document (chunk_store/<document_id>.json)
-mapping chunk id -> exact chunk text, so retrieval can return precisely the
-chunk that matched instead of guessing from section headers.
+markdown headers, embeds the chunks with BGE-M3 (1024 dims), and inserts
+them along with the full chunk text directly into the `document_chunks` 
+table in Supabase via the Supabase Python SDK.
 
 Usage:
     python ingest_knowledge_base.py /path/to/knowledge_base_folder
@@ -18,11 +13,8 @@ Usage:
 Requires a .env file with:
     SUPABASE_URL=https://your-project.supabase.co
     SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
-Optional:
-    CHUNK_STORE_DIR=chunk_store
 """
 
-import json
 import os
 import re
 import sys
@@ -88,11 +80,24 @@ def derive_disease_id(metadata: dict) -> str:
 
 
 # ---------------------------------------------------------------------
-# Step 2: Header splitting, placeholder filtering, and merging
+# Step 2: Header splitting, placeholder filtering, merging, and cleaning
 # ---------------------------------------------------------------------
 
 def word_count(text: str) -> int:
     return len(text.split())
+
+
+def clean_chunk_text(text: str) -> str:
+    """Ensures chunk text ends cleanly on a complete sentence or terminal punctuation."""
+    text = text.strip()
+    if not text:
+        return text
+    # If string ends mid-word or without terminal punctuation, trim to last valid sentence boundary
+    if text[-1] not in ".!?\":'":
+        last_punct = max(text.rfind("."), text.rfind("!"), text.rfind("?"))
+        if last_punct > 0:
+            return text[: last_punct + 1].strip()
+    return text
 
 
 def is_low_value(text: str) -> bool:
@@ -114,10 +119,11 @@ def header_split(body_text: str):
 
 
 def split_oversized(text: str) -> list:
+    """Splits oversized sections while prioritizing natural sentence endings."""
     splitter = RecursiveCharacterTextSplitter(
-        separators=["\n\n", "\n", ". ", " "],
+        separators=["\n\n", "\n", ". ", "! ", "? ", " "],
         chunk_size=MAX_WORDS * 6,
-        chunk_overlap=0,
+        chunk_overlap=30,
     )
     return splitter.split_text(text)
 
@@ -155,10 +161,18 @@ def group_and_merge(docs) -> list:
                 if piece["subsection"] and piece["subsection"] not in buffer["subsections"]:
                     buffer["subsections"].append(piece["subsection"])
             else:
-                final_chunks.append({"section": group["section"], **buffer})
+                final_chunks.append({
+                    "section": group["section"],
+                    "subsections": buffer["subsections"],
+                    "text": clean_chunk_text(buffer["text"]),
+                })
                 buffer = {"subsections": [piece["subsection"]] if piece["subsection"] else [], "text": piece["text"]}
         if buffer is not None:
-            final_chunks.append({"section": group["section"], **buffer})
+            final_chunks.append({
+                "section": group["section"],
+                "subsections": buffer["subsections"],
+                "text": clean_chunk_text(buffer["text"]),
+            })
 
     return final_chunks
 
@@ -175,18 +189,17 @@ def build_chunk_records(file_path: Path, metadata: dict, chunks: list) -> list:
     for i, chunk in enumerate(chunks):
         subsections_str = "; ".join(chunk["subsections"]) if chunk["subsections"] else ""
 
-        # Build context header locally solely for creating the embedding vector
         breadcrumb = f"Disease: {disease_name} | Section: {chunk['section']}"
         if subsections_str:
             breadcrumb += f" > {subsections_str}"
-        text_to_embed = f"[{breadcrumb}]\n\n{chunk['text']}"
+        text_with_breadcrumb = f"[{breadcrumb}]\n\n{chunk['text']}"
 
         records.append({
             "id": f"{doc_id}_chunk_{i}",
             "document_id": str(doc_id),
             "section_title": str(chunk["section"]),
             "subsection_title": str(subsections_str),
-            "text_to_embed": text_to_embed,  # Used locally for embedding, NOT sent to Supabase
+            "text": text_with_breadcrumb,  # Stored directly in Supabase Postgres table
         })
     return records
 
@@ -196,30 +209,20 @@ def insert_records(supabase: Client, records: list, embedder: SentenceTransforme
         return
 
     # Generate embeddings locally using BGE-M3
-    texts_to_embed = [r.pop("text_to_embed") for r in records]
+    texts_to_embed = [r["text"] for r in records]
     embeddings = embedder.encode(texts_to_embed, normalize_embeddings=True)
 
     # Attach vectors to records
     for record, embedding in zip(records, embeddings):
         record["embedding"] = embedding.tolist()
 
-    # Insert only IDs, metadata, and embeddings into Supabase
+    # Insert IDs, metadata, text, and embeddings into Supabase
     supabase.table("document_chunks").upsert(records).execute()
 
 
 # ---------------------------------------------------------------------
-# Step 4: Sidecar chunk store (chunk id -> exact text) for RAG hydration
+# Step 4: Process File (Pure Supabase)
 # ---------------------------------------------------------------------
-
-def write_chunk_store(document_id: str, store: dict) -> Path:
-    """Rewrites the whole sidecar for this document, so stale chunk ids
-    from a previous ingestion never linger."""
-    store_dir = Path(os.getenv("CHUNK_STORE_DIR", "chunk_store"))
-    store_dir.mkdir(parents=True, exist_ok=True)
-    path = store_dir / f"{document_id}.json"
-    path.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
-
 
 def process_file(file_path: Path, supabase: Client, embedder: SentenceTransformer) -> dict:
     raw_text = file_path.read_text(encoding="utf-8")
@@ -233,13 +236,7 @@ def process_file(file_path: Path, supabase: Client, embedder: SentenceTransforme
     if not records:
         return {"file": file_path.name, "status": "skipped", "reason": "No valid content chunks extracted"}
 
-    # Capture exact chunk text BEFORE insert_records pops "text_to_embed"
-    chunk_store = {r["id"]: r["text_to_embed"] for r in records}
-
     insert_records(supabase, records, embedder)
-
-    # Only written after the Supabase upsert succeeded
-    write_chunk_store(records[0]["document_id"], chunk_store)
 
     unverified = metadata.get("verification_status") == "NOT_INDEPENDENTLY_VERIFIED"
     return {
@@ -281,8 +278,7 @@ def main(folder: str):
     unverified = [r for r in ok if r.get("unverified")]
 
     print(f"\nDone: {len(ok)} file(s) ingested into Supabase, {len(skipped)} skipped.")
-    print(f"Total chunks inserted: {sum(r['chunks'] for r in ok)}")
-    print(f"Chunk text sidecars written to: {os.getenv('CHUNK_STORE_DIR', 'chunk_store')}/")
+    print(f"Total chunks stored: {sum(r['chunks'] for r in ok)}")
     if unverified:
         print(
             f"\nWARNING: {len(unverified)} file(s) are NOT_INDEPENDENTLY_VERIFIED "
